@@ -32,6 +32,7 @@ import (
 	"github.com/pingcap/tidb/pkg/sessionctx/vardef"
 	"github.com/pingcap/tidb/pkg/sessionctx/variable"
 	"github.com/pingcap/tidb/pkg/statistics"
+	statslogutil "github.com/pingcap/tidb/pkg/statistics/handle/logutil"
 	handle_metrics "github.com/pingcap/tidb/pkg/statistics/handle/metrics"
 	statstypes "github.com/pingcap/tidb/pkg/statistics/handle/types"
 	"github.com/pingcap/tidb/pkg/statistics/handle/usage/predicatecolumn"
@@ -40,6 +41,7 @@ import (
 	"github.com/pingcap/tidb/pkg/types"
 	"github.com/pingcap/tidb/pkg/util/intest"
 	"github.com/pingcap/tidb/pkg/util/sqlexec"
+	"go.uber.org/zap"
 )
 
 // statsReadWriter implements the util.StatsReadWriter interface.
@@ -91,6 +93,25 @@ func (s *statsReadWriter) UpdateStatsVersion() error {
 func (s *statsReadWriter) SaveTableStatsToStorage(results *statistics.AnalyzeResults, analyzeSnapshot bool, source string) (err error) {
 	var statsVer uint64
 	err = util.CallWithSCtx(s.statsHandler.SPool(), func(sctx sessionctx.Context) error {
+		start := time.Now()
+		defer func() {
+			dur := time.Since(start)
+			if err == nil && dur >= 5*s.statsHandler.Lease() {
+				statslogutil.StatsLogger().Warn("Update stats cache is too slow",
+					zap.Duration("cost time", dur),
+					// TODO: more log fields
+					zap.String("tableName", results.Job.TableName),
+				)
+				// Update stats meta to avoid other nodes missing the delta update.
+				// TODO: fix the ID.
+				if err := s.statsHandler.UpdateStatsMetaVersionForGC(results.TableID.TableID); err != nil {
+					statslogutil.StatsLogger().Error("Failed to update stats meta version for GC, the stats cache on other TiDB nodes may be inconsistent",
+						zap.Int64("physicalID", results.TableID.TableID),
+						zap.Error(err),
+					)
+				}
+			}
+		}()
 		statsVer, err = SaveTableStatsToStorage(sctx, results, analyzeSnapshot)
 		return err
 	}, util.FlagWrapTxn)
